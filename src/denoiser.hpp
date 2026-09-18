@@ -15,6 +15,10 @@ struct sampled_sequence_segment {
     std::span<const float> embedding;
     std::span<const float> initial_noise;
     std::size_t frames;
+    std::span<const float> observed{};
+    std::span<const float> observed_mask{};
+    float heading = 0.F;
+    bool heading_constrained = false;
 };
 
 struct sequence_transition {
@@ -42,17 +46,25 @@ std::expected<std::vector<float>, std::string> run_two_stage_denoiser(
     std::size_t batch, std::size_t frames);
 
 // Unconstrained separated CFG wrapper. `motion` is [T,motion_dim], embedding
-// is [4096], and the result is one clean prediction.
+// is [4096], and the result is one clean prediction. `negative_embedding`
+// is optional ([4096] or empty) — when given, it replaces the zero vector
+// that the CFG "unconditional" branch otherwise uses, which is the standard
+// diffusion negative-prompt technique (push away from `negative_embedding`
+// instead of away from nothing). Empty (the default) reproduces the exact
+// prior behavior.
 std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser(
     const ggml_motion_weights &weights, std::span<const float> motion,
     std::span<const float> embedding, float timestep, float text_weight,
-    float constraint_weight, std::size_t frames);
+    float constraint_weight, std::size_t frames,
+    std::span<const float> negative_embedding = {});
 
 // Deterministic eta=0 DDIM sampling from caller-supplied F32 initial noise.
+// `negative_embedding` — see run_separated_cfg_denoiser above.
 std::expected<std::vector<float>, std::string> sample_motion_from_noise(
     const ggml_motion_weights &weights, std::span<const float> initial_noise,
     std::span<const float> embedding, std::size_t frames, unsigned steps,
-    float text_weight, float constraint_weight);
+    float text_weight, float constraint_weight,
+    std::span<const float> negative_embedding = {});
 
 // Multi-prompt transition sampler. `observed` and `observed_mask` are [T,motion_dim]
 // normalized motion-representation values/masks. This mirrors the upstream
@@ -61,7 +73,8 @@ std::expected<std::vector<float>, std::string> sample_motion_from_noise_conditio
     const ggml_motion_weights &weights, std::span<const float> initial_noise,
     std::span<const float> embedding, std::span<const float> observed,
     std::span<const float> observed_mask, float first_heading, std::size_t frames,
-    unsigned steps, float text_weight, float constraint_weight);
+    unsigned steps, float text_weight, float constraint_weight,
+    std::span<const float> negative_embedding = {});
 
 // End-to-end upstream `_multiprompt` orchestration.  DDIM operates in
 // normalized motion space; the returned joined representation is raw so its

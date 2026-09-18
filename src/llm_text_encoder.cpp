@@ -303,6 +303,10 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
         auto *b = model.tensor((prefix + "_lora_b.weight").c_str());
         if (!b) throw std::runtime_error("missing LoRA projection");
         auto *lora = ggml_mul_mat(ctx, b, low_rank);
+        // 2.0 is not a tunable strength — it is the exact PEFT/LoRA adapter scale NVIDIA's
+        // real Kimodo text encoder uses (see vendor PORTING.md), required for numerical
+        // parity with the original PyTorch model. It was briefly exposed as a "strength"
+        // slider (KIMODO_LORA_SCALE) and removed once that distinction was confirmed.
         return ggml_add(ctx, ggml_cast(ctx, base(name, value), GGML_TYPE_F32), ggml_scale(ctx, lora, 2.F));
     };
     auto linear = [&](const char *name, ggml_tensor *value) {

@@ -265,7 +265,8 @@ ggml_tensor *layer(ggml_context *ctx,ggml_tensor*x,const ggml_motion_weights&w,s
 }
 std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser_conditioned(
     const ggml_motion_weights &, std::span<const float>, std::span<const float>,
-    std::span<const float>, std::span<const float>, float, float, float, float, std::size_t);
+    std::span<const float>, std::span<const float>, float, float, float, float, std::size_t,
+    std::span<const float> = {});
 std::expected<std::vector<float>, std::string> run_motion_transformer(
     const ggml_motion_weights &w, std::string_view prefix,
     std::span<const float> motion, size_t motion_dim,
@@ -447,22 +448,27 @@ std::expected<std::vector<float>, std::string> run_two_stage_denoiser(
 std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser(
     const ggml_motion_weights &weights, std::span<const float> motion,
     std::span<const float> embedding, float timestep, float text_weight,
-    float constraint_weight, std::size_t frames) {
+    float constraint_weight, std::size_t frames,
+    std::span<const float> negative_embedding) {
     const std::vector<float> empty(frames*weights.motion_dim(), 0.f);
     return run_separated_cfg_denoiser_conditioned(weights, motion, embedding, empty, empty,
-                                                  timestep, 0.f, text_weight, constraint_weight, frames);
+                                                  timestep, 0.f, text_weight, constraint_weight, frames,
+                                                  negative_embedding);
 }
 
 std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser_conditioned(
     const ggml_motion_weights &weights, std::span<const float> motion,
     std::span<const float> embedding, std::span<const float> observed,
     std::span<const float> observed_mask, float timestep, float heading,
-    float text_weight, float constraint_weight, std::size_t frames) {
+    float text_weight, float constraint_weight, std::size_t frames,
+    std::span<const float> negative_embedding) {
     const size_t dim=weights.motion_dim();
     if (!dim || motion.size()!=frames*dim || embedding.size()!=4096 || !std::isfinite(timestep) || !std::isfinite(text_weight) || !std::isfinite(constraint_weight))
         return std::unexpected("invalid separated CFG denoiser input");
     if (observed.size()!=frames*dim || observed_mask.size()!=frames*dim || !std::isfinite(heading))
         return std::unexpected("invalid separated CFG condition dimensions");
+    if (!negative_embedding.empty() && negative_embedding.size()!=4096)
+        return std::unexpected("negative_embedding must be empty or exactly 4096 values");
     constexpr size_t cfg_batch=3; std::vector<float> extended(cfg_batch*frames*2*dim), text(cfg_batch*4096), times(cfg_batch,timestep), headings(cfg_batch,heading), mask(cfg_batch*frames,1.f);
     for(size_t b=0;b<cfg_batch;++b) for(size_t t=0;t<frames;++t) {
         auto *dst=extended.data()+(b*frames+t)*2*dim;
@@ -475,6 +481,13 @@ std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser_condit
     // Only branch zero has text. Branch one is constraint-only; branch two is
     // unconditional. This is the upstream separated-CFG batch order.
     std::memcpy(text.data(),embedding.data(),4096*sizeof(float));
+    // Standard diffusion negative-prompt technique: fill the "unconditional"
+    // branch's text slot with the negative-prompt embedding instead of
+    // leaving it zero, so CFG pushes away from that concept specifically
+    // rather than away from nothing. Left zero (upstream behavior) when no
+    // negative prompt was given.
+    if (!negative_embedding.empty())
+        std::memcpy(text.data()+2*4096,negative_embedding.data(),4096*sizeof(float));
     auto all=run_two_stage_denoiser(weights,extended,text,times,headings,mask,cfg_batch,frames);
     if(!all)return std::unexpected(all.error());
     std::vector<float> result(frames*dim);
@@ -485,13 +498,14 @@ std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser_condit
 std::expected<std::vector<float>, std::string> sample_motion_from_noise(
     const ggml_motion_weights &weights, std::span<const float> initial,
     std::span<const float> embedding, std::size_t frames, unsigned steps,
-    float text_weight, float constraint_weight) {
+    float text_weight, float constraint_weight,
+    std::span<const float> negative_embedding) {
     if(initial.size()!=frames*weights.motion_dim()) return std::unexpected("invalid initial motion noise dimensions");
     auto schedule=make_cosine_schedule(1000,steps); if(!schedule)return std::unexpected(schedule.error());
     std::vector<float> state(initial.begin(),initial.end()), next(state.size());
     for(unsigned i=steps;i-->0;) {
         const auto step_started = std::chrono::steady_clock::now();
-        auto clean=run_separated_cfg_denoiser(weights,state,embedding,float(schedule->use_timesteps[i]),text_weight,constraint_weight,frames);
+        auto clean=run_separated_cfg_denoiser(weights,state,embedding,float(schedule->use_timesteps[i]),text_weight,constraint_weight,frames,negative_embedding);
         if(!clean)return std::unexpected(clean.error());
         auto stepped=ddim_step(*schedule,i,state.data(),clean->data(),next.data(),state.size());
         if(!stepped)return std::unexpected(stepped.error());
@@ -506,14 +520,16 @@ std::expected<std::vector<float>, std::string> sample_motion_from_noise_conditio
     const ggml_motion_weights &weights, std::span<const float> initial,
     std::span<const float> embedding, std::span<const float> observed,
     std::span<const float> observed_mask, float heading, std::size_t frames,
-    unsigned steps, float text_weight, float constraint_weight) {
+    unsigned steps, float text_weight, float constraint_weight,
+    std::span<const float> negative_embedding) {
     if(initial.size()!=frames*weights.motion_dim() || observed.size()!=initial.size() || observed_mask.size()!=initial.size())
         return std::unexpected("invalid conditioned motion noise dimensions");
     auto schedule=make_cosine_schedule(1000,steps); if(!schedule)return std::unexpected(schedule.error());
     std::vector<float> state(initial.begin(),initial.end()), next(state.size());
     for(unsigned i=steps;i-->0;) {
         auto clean=run_separated_cfg_denoiser_conditioned(weights,state,embedding,observed,observed_mask,
-                                                           float(schedule->use_timesteps[i]),heading,text_weight,constraint_weight,frames);
+                                                           float(schedule->use_timesteps[i]),heading,text_weight,constraint_weight,frames,
+                                                           negative_embedding);
         if(!clean)return std::unexpected(clean.error());
         auto stepped=ddim_step(*schedule,i,state.data(),clean->data(),next.data(),state.size());
         if(!stepped)return std::unexpected(stepped.error());
